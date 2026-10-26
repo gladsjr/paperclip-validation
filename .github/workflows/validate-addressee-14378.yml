@@ -68,6 +68,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          set +e # Baseline is expected to fail; validate it in the next step.
           node --version > validation-evidence/node-version.txt
           pnpm --version > validation-evidence/pnpm-version.txt
           cd server
