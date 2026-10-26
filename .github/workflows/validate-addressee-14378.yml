@@ -18,7 +18,7 @@ jobs:
     env:
       PR_HEAD: 16730d55f676f32308f79928c6fa1526b9066f08
       PR_BASE: ba04968b1068ab815ecfbffbac414c4f49a714f0
-      PAPERCLIP_HOME: ${{ runner.temp }}/paperclip-independent-test-home
+      PAPERCLIP_HOME: /tmp/paperclip-independent-test-home
       PAPERCLIP_TEST_POSTGRES_RESERVED_PORTS: '5432,54329'
       PAPERCLIP_TELEMETRY_ENABLED: 'false'
       DO_NOT_TRACK: '1'
