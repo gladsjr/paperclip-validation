@@ -1,0 +1,130 @@
+name: Independent validation of Paperclip addressee wake fix
+on:
+  workflow_dispatch:
+  push:
+    branches: [validation/addressee-14378]
+    paths: [.github/workflows/validate-addressee-14378.yml]
+permissions:
+  contents: read
+jobs:
+  compare:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, patched]
+    env:
+      PR_HEAD: 16730d55f676f32308f79928c6fa1526b9066f08
+      PR_BASE: ba04968b1068ab815ecfbffbac414c4f49a714f0
+      PAPERCLIP_HOME: ${{ runner.temp }}/paperclip-independent-test-home
+      PAPERCLIP_TEST_POSTGRES_RESERVED_PORTS: '5432,54329'
+      PAPERCLIP_TELEMETRY_ENABLED: 'false'
+      DO_NOT_TRACK: '1'
+    steps:
+      - name: Check out the exact proposed fix (no saved credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: paperclipai/paperclip
+          ref: refs/pull/14378/head
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify immutable head and prepare baseline control
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PR_HEAD"
+          git fetch --depth=1 origin "$PR_BASE"
+          mkdir -p validation-evidence
+          git rev-parse HEAD > validation-evidence/pr-head.txt
+          printf '%s\n' "$PR_BASE" > validation-evidence/pr-base.txt
+          if [ '${{ matrix.variant }}' = baseline ]; then
+            # Keep the PR's regression tests and identical dependencies, but
+            # restore every production TypeScript file changed by this PR.
+            git diff --name-only "$PR_BASE" "$PR_HEAD" -- server/src |
+              while IFS= read -r file; do
+                case "$file" in
+                  *.test.ts) ;;
+                  *.ts) git restore --source="$PR_BASE" -- "$file" ;;
+                esac
+              done
+          fi
+          git diff --stat > validation-evidence/working-tree-diff.txt
+          git diff -- server/src > validation-evidence/production-control.patch
+      - name: Set up pnpm 9.15.4
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+        with:
+          version: 9.15.4
+      - name: Set up Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Install exact lockfile dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build test imports
+        run: node scripts/ensure-plugin-build-deps.mjs
+      - name: Run regression against a temporary PostgreSQL and simulated executor
+        shell: bash
+        run: |
+          set -uo pipefail
+          node --version > validation-evidence/node-version.txt
+          pnpm --version > validation-evidence/pnpm-version.txt
+          cd server
+          if [ '${{ matrix.variant }}' = baseline ]; then
+            node ../node_modules/vitest/vitest.mjs run \
+              src/__tests__/heartbeat-stale-queue-invalidation.test.ts \
+              -t 'runs the named addressee even though another agent is the issue assignee' \
+              --reporter=verbose --reporter=json --outputFile=../validation-evidence/results.json \
+              2>&1 | tee ../validation-evidence/test-output.log
+          else
+            node ../node_modules/vitest/vitest.mjs run \
+              src/modules/run-dispatch/domain/policy.test.ts \
+              src/modules/run-dispatch/adapters/postgres.test.ts \
+              src/__tests__/heartbeat-stale-queue-invalidation.test.ts \
+              --reporter=verbose --reporter=json --outputFile=../validation-evidence/results.json \
+              2>&1 | tee ../validation-evidence/test-output.log
+          fi
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > ../validation-evidence/vitest-exit-code.txt
+          # The next step checks the expected before/after result explicitly.
+          exit 0
+      - name: Require the expected result (never accept skipped database tests)
+        env:
+          VARIANT: ${{ matrix.variant }}
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import assert from 'node:assert/strict';
+          const d=JSON.parse(fs.readFileSync('validation-evidence/results.json','utf8'));
+          const assertions=d.testResults.flatMap(x=>x.assertionResults ?? []);
+          const target=assertions.filter(x=>x.fullName.includes('runs the named addressee even though another agent is the issue assignee'));
+          assert.equal(target.length,1,'The actual PostgreSQL regression must be collected');
+          const baseline=process.env.VARIANT==='baseline';
+          assert.equal(target[0].status,baseline?'failed':'passed','A skipped test is not validation');
+          if(baseline){
+            assert.equal(d.numFailedTests,1,'Baseline must fail only in the intended regression');
+            assert.equal(d.numPassedTests,0);
+            assert.match(target[0].failureMessages.join('\n'),/expected false to be true|toBe/);
+          } else {
+            assert.equal(d.success,true);
+            assert.equal(d.numFailedTests,0);
+            assert.equal(d.numPendingTests,0,'No database suite may silently skip');
+            assert.ok(d.numPassedTests>100,'Require the assembled-service tests, not only pure policy tests');
+          }
+          const summary={variant:process.env.VARIANT,head:process.env.PR_HEAD,base:process.env.PR_BASE,
+            total:d.numTotalTests,passed:d.numPassedTests,failed:d.numFailedTests,skippedOrFiltered:d.numPendingTests,
+            primaryRegression:target[0].status,
+            scope:'Real temporary PostgreSQL and heartbeat service; simulated model executor. No live Claude/provider or production data.'};
+          fs.writeFileSync('validation-evidence/summary.json',JSON.stringify(summary,null,2)+'\n');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,'```json\n'+JSON.stringify(summary,null,2)+'\n```\n');
+          JS
+      - name: Publish logs and machine-readable results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: independent-addressee-${{ matrix.variant }}
+          path: validation-evidence/
+          if-no-files-found: error
+          retention-days: 30
