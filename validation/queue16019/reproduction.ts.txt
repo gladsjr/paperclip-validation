@@ -1,0 +1,41 @@
+  it("independent queue16019: delivers a fresh confirmation to a non-assignee without transferring ownership", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [reviewer] = await db.insert(agents).values({ companyId, name: "Reviewer", role: "ceo", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true } }, permissions: {} }).returning();
+    const [issue] = await db.insert(issues).values({ companyId, title: "Synthetic non-assignee confirmation", status: "in_progress", assigneeAgentId: agentId }).returning();
+    const [interaction] = await db.insert(issueThreadInteractions).values({ companyId, issueId: issue.id, kind: "request_confirmation", status: "pending", continuationPolicy: "wake_assignee", requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "inherited", addresseeAgentId: reviewer.id, createdByAgentId: agentId, payload: { version: 1, prompt: "Review synthetic delivery" } }).returning();
+    await heartbeat.wakeup(reviewer.id, { source: "automation", triggerDetail: "system", reason: "interaction_pending", requestedByActorType: "agent", requestedByActorId: agentId, payload: { issueId: issue.id, interactionId: interaction.id, interactionKind: interaction.kind, mutation: "interaction" }, contextSnapshot: { source: "issue.interaction.created", issueId: issue.id, interactionId: interaction.id, interactionKind: interaction.kind, wakeReason: "interaction_pending" } });
+    const delivered = await waitForCondition(async () => mockAdapterExecute.mock.calls.some(([context]) => context?.agent.id === reviewer.id), 4000);
+    expect(delivered, "fresh named addressee must execute without changing the issue assignee").toBe(true);
+    expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].assigneeAgentId).toBe(agentId);
+  }, 20000);
+
+  it("independent queue16019: drains a new confirmation behind obsolete deferred interactions after the producer ends", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [reviewer] = await db.insert(agents).values({ companyId, name: "Reviewer", role: "ceo", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true } }, permissions: {} }).returning();
+    const [issue] = await db.insert(issues).values({ companyId, title: "Synthetic stale queue backlog", status: "in_progress", assigneeAgentId: agentId }).returning();
+    let unblock!: () => void;
+    const producerGate = new Promise<void>(resolve => { unblock = resolve; });
+    mockAdapterExecute.mockImplementation(async (context: any) => {
+      if (context.agent.id === agentId) {
+        await producerGate;
+        await db.insert(issueComments).values({ companyId, issueId: issue.id, authorAgentId: agentId, createdByRunId: context.runId, body: "Synthetic producer delivery" });
+      }
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Synthetic queue test", provider: "test", model: "test-model" };
+    });
+    const owner = await heartbeat.wakeup(agentId, { source: "assignment", triggerDetail: "system", reason: "issue_assigned", requestedByActorType: "system", payload: { issueId: issue.id } });
+    try {
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.some(([context]) => context?.agent.id === agentId), 4000), "producer must actually enter the mocked executor").toBe(true);
+      for (let n = 0; n < 2; n++) {
+        const [old] = await db.insert(issueThreadInteractions).values({ companyId, issueId: issue.id, kind: "ask_user_questions", status: n === 0 ? "expired" : "answered", continuationPolicy: "wake_assignee", requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "inherited", addresseeAgentId: reviewer.id, createdByAgentId: agentId, resolvedAt: new Date(), payload: { version: 1, questions: [] } }).returning();
+        const context = { source: "issue.interaction.created", issueId: issue.id, interactionId: old.id, interactionKind: old.kind, wakeReason: "interaction_pending" };
+        await db.insert(agentWakeupRequests).values({ companyId, agentId: reviewer.id, source: "automation", reason: "interaction_pending", status: "deferred_issue_execution", requestedByActorType: "agent", requestedByActorId: agentId, requestedAt: new Date(Date.now() - (2-n)*1000), payload: { issueId: issue.id, interactionId: old.id, interactionKind: old.kind, mutation: "interaction", _paperclipWakeContext: context } });
+      }
+      const [fresh] = await db.insert(issueThreadInteractions).values({ companyId, issueId: issue.id, kind: "request_confirmation", status: "pending", continuationPolicy: "wake_assignee", requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "inherited", addresseeAgentId: reviewer.id, createdByAgentId: agentId, sourceRunId: owner!.id, payload: { version: 1, prompt: "Review latest synthetic delivery" } }).returning();
+      await heartbeat.wakeup(reviewer.id, { source: "automation", triggerDetail: "system", reason: "interaction_pending", requestedByActorType: "agent", requestedByActorId: agentId, payload: { issueId: issue.id, interactionId: fresh.id, interactionKind: fresh.kind, mutation: "interaction" }, contextSnapshot: { source: "issue.interaction.created", issueId: issue.id, interactionId: fresh.id, interactionKind: fresh.kind, wakeReason: "interaction_pending" } });
+      unblock();
+      await heartbeat.waitForRunExecutionDrain(owner!.id);
+      const delivered = await waitForCondition(async () => mockAdapterExecute.mock.calls.some(([context]) => context?.agent.id === reviewer.id), 4000);
+      expect(delivered, "the pending confirmation behind obsolete receipts must execute without a manual nudge or periodic rescue").toBe(true);
+      expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].assigneeAgentId).toBe(agentId);
+    } finally { unblock(); }
+  }, 25000);
