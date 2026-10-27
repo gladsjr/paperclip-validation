@@ -58,7 +58,7 @@ jobs:
           from pathlib import Path
           p=Path('server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts')
           t=p.read_text()
-          marker='  it.each(["legacy", "native"])'
+          marker='  beforeAll(async () => {'
           assert marker in t, 'Known integration fixture changed; do not claim a test result'
           probes=Path('../harness/validation/queue16019/reproduction.ts.txt').read_text()
           p.write_text(t.replace(marker, probes+'\n'+marker, 1))
