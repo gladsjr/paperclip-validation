@@ -1,0 +1,130 @@
+name: Validate Paperclip queue PR16019 and preserve addressee behavior
+on:
+  push:
+    branches: [validation/queue-16019]
+    paths: [.github/workflows/validate-queue-16019.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, patched, installed]
+    env:
+      PR_HEAD: 57e0fc0494f4a83dfa5087156cc426fb600154de
+      PR_BASE: 043f2514e67c50320433a0013fb228a75a51325c
+      INSTALLED: 16730d55f676f32308f79928c6fa1526b9066f08
+      PAPERCLIP_HOME: /tmp/paperclip-queue-validation-home
+      PAPERCLIP_TEST_POSTGRES_RESERVED_PORTS: '5432,54329'
+      PAPERCLIP_TELEMETRY_ENABLED: 'false'
+      DO_NOT_TRACK: '1'
+    steps:
+      - name: Check out public validation fixtures
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Check out upstream PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: paperclipai/paperclip
+          ref: refs/pull/16019/head
+          path: project
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Pin source and install independent probes
+        working-directory: project
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PR_HEAD"
+          mkdir -p validation-evidence
+          if [ "$VARIANT" = installed ]; then
+            git fetch --depth=1 origin "$INSTALLED"
+            git checkout --detach "$INSTALLED"
+          elif [ "$VARIANT" = baseline ]; then
+            git fetch --depth=1 origin "$PR_BASE"
+            git restore --source="$PR_BASE" -- server/src/modules/run-dispatch/domain/policy.ts server/src/modules/run-dispatch/index.ts server/src/modules/wake-queue/adapters/postgres.ts
+          fi
+          git rev-parse HEAD > validation-evidence/checkout-sha.txt
+          git diff --stat > validation-evidence/production-control.txt
+          cp ../harness/validation/queue16019/successor-gate.test.ts.txt server/src/modules/wake-queue/adapters/independent-successor-gate.test.ts
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts')
+          t=p.read_text()
+          marker='  it.each(["legacy", "native"])'
+          assert marker in t, 'Known integration fixture changed; do not claim a test result'
+          probes=Path('../harness/validation/queue16019/reproduction.ts.txt').read_text()
+          p.write_text(t.replace(marker, probes+'\n'+marker, 1))
+          PY
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+        with:
+          version: 9.15.4
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Install pinned dependencies and build imports
+        working-directory: project
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          node scripts/ensure-plugin-build-deps.mjs
+      - name: Run the upstream successor regression on real temporary PostgreSQL
+        working-directory: project/server
+        run: |
+          set +e
+          node ../node_modules/vitest/vitest.mjs run src/modules/wake-queue/adapters/independent-successor-gate.test.ts --reporter=verbose --reporter=json --outputFile=../validation-evidence/upstream.json > ../validation-evidence/upstream.log 2>&1
+          code=$?
+          echo "$code" > ../validation-evidence/upstream-exit.txt
+          tail -25 ../validation-evidence/upstream.log
+          exit 0
+      - name: Run independent addressed-confirmation and stale-backlog probes
+        working-directory: project/server
+        run: |
+          set +e
+          node ../node_modules/vitest/vitest.mjs run src/__tests__/heartbeat-stale-queue-invalidation.test.ts -t 'independent queue16019:' --reporter=verbose --reporter=json --outputFile=../validation-evidence/independent.json > ../validation-evidence/independent.log 2>&1
+          code=$?
+          echo "$code" > ../validation-evidence/independent-exit.txt
+          tail -45 ../validation-evidence/independent.log
+          exit 0
+      - name: Require collected database tests and publish actual results
+        if: always()
+        working-directory: project
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          python3 - <<'PY'
+          import json,os
+          from pathlib import Path
+          results={}
+          for label,expected in [('upstream',6),('independent',2)]:
+              p=Path('validation-evidence')/(label+'.json')
+              assert p.exists(), label+' test runner did not produce results'
+              d=json.loads(p.read_text())
+              a=[a for t in d['testResults'] for a in t.get('assertionResults',[]) if label=='upstream' or 'independent queue16019:' in a.get('fullName','')]
+              assert len(a)==expected,(label,len(a),expected)
+              assert all(a['status'] in ['passed','failed'] for a in a), 'Skipped database tests are not proof'
+              results[label]=[{'name':a['fullName'],'status':a['status'],'failureMessages':a.get('failureMessages',[])} for a in a]
+          report={'variant':os.environ['VARIANT'],'results':results,'scope':'Temporary real PostgreSQL; model executor mocked; no production data or credentials. Workflow success means evidence collected, not that all tests passed.'}
+          Path('validation-evidence/summary.json').write_text(json.dumps(report,indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write('## '+report['variant']+'\n')
+              for label,rows in results.items():
+                  f.write('\n### '+label+'\n')
+                  for row in rows:f.write('- '+row['status']+': '+row['name']+'\n')
+          print(json.dumps(report,indent=2))
+          PY
+      - name: Upload public evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: queue16019-${{ matrix.variant }}
+          path: project/validation-evidence/
+          retention-days: 30
